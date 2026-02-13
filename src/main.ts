@@ -23,6 +23,32 @@ function parseBoolean(input: string): boolean {
 }
 
 /**
+ * Parse a multiline string of key=value pairs into an array of variable objects
+ * @param input Multiline string of key=value pairs
+ * @returns Array of {key, value, type: "custom"} objects, or undefined if empty
+ */
+export function parseVars(
+  input: string
+): { key: string; value: string; type: string }[] | undefined {
+  if (!input) return undefined
+
+  const vars = input
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && line.includes('='))
+    .map((line) => {
+      const eqIndex = line.indexOf('=')
+      return {
+        key: line.substring(0, eqIndex),
+        value: line.substring(eqIndex + 1),
+        type: 'custom'
+      }
+    })
+
+  return vars.length > 0 ? vars : undefined
+}
+
+/**
  * Parse a string number to a number
  * @param input The input string
  * @returns Number value
@@ -220,9 +246,13 @@ export async function run(): Promise<void> {
     const block = parseBoolean(core.getInput('block'))
     const maxRetries = parseNumber(core.getInput('maxRetries'))
     const timeout = parseNumber(core.getInput('timeout')) || 600
+    const varsInput = core.getInput('vars')
 
     // Parse suiteIds if provided
     const suiteIds = parseStringArray(suiteIdsInput)
+
+    // Parse vars if provided
+    const vars = parseVars(varsInput)
 
     // Debug logs
     core.debug('Inputs:')
@@ -232,11 +262,13 @@ export async function run(): Promise<void> {
     core.debug(`- block: ${block}`)
     core.debug(`- maxRetries: ${maxRetries}`)
     core.debug(`- timeout: ${timeout}`)
+    core.debug(`- vars: ${vars ? JSON.stringify(vars) : 'not provided'}`)
 
     // Prepare request body
     const body: Record<string, unknown> = {}
     if (suiteIds) body.suite_ids = suiteIds
     body.fail_fast = failFast
+    if (vars) body.vars = vars
 
     // Not implemented yet
     // body.block = block

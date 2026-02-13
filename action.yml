@@ -36,6 +36,9 @@ inputs:
     description: 'Maximum time in seconds to wait for the test suite to complete'
     required: false
     default: '600'
+  vars:
+    description: 'Variable overrides as key=value pairs (one per line)'
+    required: false
 
 # Define your outputs here.
 outputs:

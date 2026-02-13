@@ -14,7 +14,7 @@ real-time results through server-sent events (SSE).
 ```yaml
 steps:
   - name: Run desplega.ai tests
-    uses: tarasyarema/desplega.ai-action@v0.3.1
+    uses: tarasyarema/desplega.ai-action@v0.4.0
     with:
       apiKey: ${{ secrets.DESPLEGA_API_KEY }}
       suiteIds: 'suite-id-1'
@@ -33,6 +33,8 @@ steps:
 | `failFast`   | Whether to stop on first failure                                | No       | false                                                        |
 | `block`      | Whether to block execution                                      | No       | false                                                        |
 | `maxRetries` | Maximum number of retries for trigger call (0 disables retries) | No       | 0                                                            |
+| `timeout`    | Maximum time in seconds to wait for the test suite to complete  | No       | 600                                                          |
+| `vars`       | Variable overrides as `key=value` pairs (one per line)          | No       | -                                                            |
 
 ## Outputs
 
@@ -71,6 +73,42 @@ call when transient errors occur:
 
 This helps improve reliability when dealing with temporary service
 unavailability or network issues.
+
+## Variable Overrides
+
+Use the `vars` input to override test variables at trigger time. This is useful
+for passing dynamic values like preview URLs or secrets into your test suites.
+
+Each variable is a `key=value` pair, one per line. Values can contain `=` signs.
+
+```yaml
+steps:
+  - name: Run desplega.ai tests
+    uses: tarasyarema/desplega.ai-action@v0.4.0
+    with:
+      apiKey: ${{ secrets.DESPLEGA_API_KEY }}
+      suiteIds: 'suite-id-1'
+      vars: |
+        base_url=https://preview-${{ github.event.number }}.example.com
+        login_password=${{ secrets.TEST_PASSWORD }}
+```
+
+A common pattern is overriding `base_url` to point tests at a preview deployment:
+
+```yaml
+steps:
+  - name: Deploy preview
+    id: deploy
+    run: echo "url=https://pr-${{ github.event.number }}.staging.example.com" >> "$GITHUB_OUTPUT"
+
+  - name: Run E2E tests against preview
+    uses: tarasyarema/desplega.ai-action@v0.4.0
+    with:
+      apiKey: ${{ secrets.DESPLEGA_API_KEY }}
+      suiteIds: 'suite-id-1'
+      vars: |
+        base_url=${{ steps.deploy.outputs.url }}
+```
 
 - The action monitors the status of the test run and fails if the status is
   "failed"

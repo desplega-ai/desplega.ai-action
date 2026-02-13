@@ -27268,6 +27268,28 @@ function parseBoolean(input) {
     return input.toLowerCase() === 'true';
 }
 /**
+ * Parse a multiline string of key=value pairs into an array of variable objects
+ * @param input Multiline string of key=value pairs
+ * @returns Array of {key, value, type: "custom"} objects, or undefined if empty
+ */
+function parseVars(input) {
+    if (!input)
+        return undefined;
+    const vars = input
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0 && line.includes('='))
+        .map((line) => {
+        const eqIndex = line.indexOf('=');
+        return {
+            key: line.substring(0, eqIndex),
+            value: line.substring(eqIndex + 1),
+            type: 'custom'
+        };
+    });
+    return vars.length > 0 ? vars : undefined;
+}
+/**
  * Parse a string number to a number
  * @param input The input string
  * @returns Number value
@@ -27436,8 +27458,11 @@ async function run() {
         const block = parseBoolean(coreExports.getInput('block'));
         const maxRetries = parseNumber(coreExports.getInput('maxRetries'));
         const timeout = parseNumber(coreExports.getInput('timeout')) || 600;
+        const varsInput = coreExports.getInput('vars');
         // Parse suiteIds if provided
         const suiteIds = parseStringArray(suiteIdsInput);
+        // Parse vars if provided
+        const vars = parseVars(varsInput);
         // Debug logs
         coreExports.debug('Inputs:');
         coreExports.debug(`- originUrl: ${originUrl}`);
@@ -27446,11 +27471,14 @@ async function run() {
         coreExports.debug(`- block: ${block}`);
         coreExports.debug(`- maxRetries: ${maxRetries}`);
         coreExports.debug(`- timeout: ${timeout}`);
+        coreExports.debug(`- vars: ${vars ? JSON.stringify(vars) : 'not provided'}`);
         // Prepare request body
         const body = {};
         if (suiteIds)
             body.suite_ids = suiteIds;
         body.fail_fast = failFast;
+        if (vars)
+            body.vars = vars;
         // Not implemented yet
         // body.block = block
         try {

@@ -76,7 +76,7 @@ jest.unstable_mockModule('@actions/core', () => core)
 
 // The module being tested should be imported dynamically. This ensures that the
 // mocks are used in place of any actual dependencies.
-const { run } = await import('../src/main.js')
+const { run, parseVars } = await import('../src/main.js')
 
 describe('main.ts', () => {
   const mockApiKey = 'test-api-key'
@@ -663,6 +663,112 @@ describe('main.ts', () => {
       )
 
       jest.useRealTimers()
+    })
+  })
+
+  describe('parseVars', () => {
+    it('Should parse basic key=value pairs', () => {
+      const result = parseVars('base_url=https://staging.example.com\nlogin_password=s3cret')
+      expect(result).toEqual([
+        { key: 'base_url', value: 'https://staging.example.com', type: 'custom' },
+        { key: 'login_password', value: 's3cret', type: 'custom' }
+      ])
+    })
+
+    it('Should handle values containing = signs', () => {
+      const result = parseVars('token=abc=def=ghi')
+      expect(result).toEqual([
+        { key: 'token', value: 'abc=def=ghi', type: 'custom' }
+      ])
+    })
+
+    it('Should skip empty lines and whitespace-only lines', () => {
+      const result = parseVars('key1=val1\n\n  \nkey2=val2')
+      expect(result).toEqual([
+        { key: 'key1', value: 'val1', type: 'custom' },
+        { key: 'key2', value: 'val2', type: 'custom' }
+      ])
+    })
+
+    it('Should skip lines without =', () => {
+      const result = parseVars('key1=val1\nno_equals_here\nkey2=val2')
+      expect(result).toEqual([
+        { key: 'key1', value: 'val1', type: 'custom' },
+        { key: 'key2', value: 'val2', type: 'custom' }
+      ])
+    })
+
+    it('Should trim whitespace around lines', () => {
+      const result = parseVars('  key1=val1  \n  key2=val2  ')
+      expect(result).toEqual([
+        { key: 'key1', value: 'val1', type: 'custom' },
+        { key: 'key2', value: 'val2', type: 'custom' }
+      ])
+    })
+
+    it('Should return undefined for empty string', () => {
+      expect(parseVars('')).toBeUndefined()
+    })
+
+    it('Should return undefined for whitespace-only input', () => {
+      expect(parseVars('  \n  \n  ')).toBeUndefined()
+    })
+
+    it('Should handle value with empty string', () => {
+      const result = parseVars('key=')
+      expect(result).toEqual([
+        { key: 'key', value: '', type: 'custom' }
+      ])
+    })
+  })
+
+  describe('vars in trigger request', () => {
+    it('Should include vars in trigger body when provided', async () => {
+      core.getInput.mockImplementation((name) => {
+        if (name === 'apiKey') return mockApiKey
+        if (name === 'originUrl') return mockOriginUrl
+        if (name === 'suiteIds') return 'suite1'
+        if (name === 'failFast') return 'false'
+        if (name === 'block') return 'false'
+        if (name === 'vars') return 'base_url=https://preview.example.com\nlogin_password=test123'
+        return ''
+      })
+
+      await run()
+
+      // Find the trigger call and verify vars are in the body
+      const triggerCall = fetchMock.mock.calls.find(
+        (call) => call[0] === `${mockOriginUrl}/external/actions/trigger`
+      )
+      expect(triggerCall).toBeDefined()
+
+      const body = JSON.parse(triggerCall![1]!.body as string)
+      expect(body.vars).toEqual([
+        { key: 'base_url', value: 'https://preview.example.com', type: 'custom' },
+        { key: 'login_password', value: 'test123', type: 'custom' }
+      ])
+    })
+
+    it('Should omit vars from trigger body when input is empty', async () => {
+      core.getInput.mockImplementation((name) => {
+        if (name === 'apiKey') return mockApiKey
+        if (name === 'originUrl') return mockOriginUrl
+        if (name === 'suiteIds') return 'suite1'
+        if (name === 'failFast') return 'false'
+        if (name === 'block') return 'false'
+        if (name === 'vars') return ''
+        return ''
+      })
+
+      await run()
+
+      const triggerCall = fetchMock.mock.calls.find(
+        (call) => call[0] === `${mockOriginUrl}/external/actions/trigger`
+      )
+      expect(triggerCall).toBeDefined()
+
+      const body = JSON.parse(triggerCall![1]!.body as string)
+      expect(body.vars).toBeUndefined()
     })
   })
 
