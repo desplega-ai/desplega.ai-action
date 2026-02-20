@@ -88,13 +88,13 @@ describe('main.ts', () => {
     jest.resetAllMocks()
     jest.clearAllMocks()
 
-    // Set up input mocks
+    // Set up input mocks — block: true so SSE is tested
     core.getInput.mockImplementation((name) => {
       if (name === 'apiKey') return mockApiKey
       if (name === 'originUrl') return mockOriginUrl
       if (name === 'suiteIds') return 'suite1,suite2'
       if (name === 'failFast') return 'false'
-      if (name === 'block') return 'false'
+      if (name === 'block') return 'true'
       return ''
     })
 
@@ -391,7 +391,7 @@ describe('main.ts', () => {
         if (name === 'originUrl') return mockOriginUrl
         if (name === 'suiteIds') return 'suite1,suite2'
         if (name === 'failFast') return 'false'
-        if (name === 'block') return 'false'
+        if (name === 'block') return 'true'
         if (name === 'maxRetries') return '2' // Enable retries
         return ''
       })
@@ -538,7 +538,7 @@ describe('main.ts', () => {
         if (name === 'originUrl') return mockOriginUrl
         if (name === 'suiteIds') return 'suite1,suite2'
         if (name === 'failFast') return 'false'
-        if (name === 'block') return 'false'
+        if (name === 'block') return 'true'
         if (name === 'maxRetries') return '0' // Disable retries
         return ''
       })
@@ -589,7 +589,7 @@ describe('main.ts', () => {
         if (name === 'originUrl') return mockOriginUrl
         if (name === 'suiteIds') return 'suite1,suite2'
         if (name === 'failFast') return 'false'
-        if (name === 'block') return 'false'
+        if (name === 'block') return 'true'
         if (name === 'timeout') return '1'
         return ''
       })
@@ -729,7 +729,7 @@ describe('main.ts', () => {
         if (name === 'originUrl') return mockOriginUrl
         if (name === 'suiteIds') return 'suite1'
         if (name === 'failFast') return 'false'
-        if (name === 'block') return 'false'
+        if (name === 'block') return 'true'
         if (name === 'vars') return 'base_url=https://preview.example.com\nlogin_password=test123'
         return ''
       })
@@ -755,7 +755,7 @@ describe('main.ts', () => {
         if (name === 'originUrl') return mockOriginUrl
         if (name === 'suiteIds') return 'suite1'
         if (name === 'failFast') return 'false'
-        if (name === 'block') return 'false'
+        if (name === 'block') return 'true'
         if (name === 'vars') return ''
         return ''
       })
@@ -772,6 +772,54 @@ describe('main.ts', () => {
     })
   })
 
+  describe('Non-blocking mode', () => {
+    it('Should exit immediately after trigger when block is false', async () => {
+      core.getInput.mockImplementation((name) => {
+        if (name === 'apiKey') return mockApiKey
+        if (name === 'originUrl') return mockOriginUrl
+        if (name === 'suiteIds') return 'suite1,suite2'
+        if (name === 'failFast') return 'false'
+        if (name === 'block') return 'false'
+        return ''
+      })
+
+      fetchMock.mockImplementation(async (url) => {
+        if (url === `${mockOriginUrl}/version`) {
+          return createMockResponse({
+            ok: true,
+            json: async () => ({ version: '1337' })
+          })
+        } else if (url === `${mockOriginUrl}/external/actions/trigger`) {
+          return createMockResponse({
+            ok: true,
+            json: async () => ({ run_id: mockRunId })
+          })
+        }
+
+        return createMockResponse({
+          ok: false,
+          status: 404,
+          text: async () => 'Not found'
+        })
+      })
+
+      await run()
+
+      // Should set runId and status=running
+      expect(core.setOutput).toHaveBeenCalledWith('runId', mockRunId)
+      expect(core.setOutput).toHaveBeenCalledWith('status', 'running')
+
+      // Should NOT connect to SSE
+      expect(fetchMock).not.toHaveBeenCalledWith(
+        `${mockOriginUrl}/external/actions/run/${mockRunId}/events`,
+        expect.any(Object)
+      )
+
+      // Should not fail
+      expect(core.setFailed).not.toHaveBeenCalled()
+    })
+  })
+
   describe('SSE buffer partial chunk parsing', () => {
     it('Should correctly parse events split across multiple chunks', async () => {
       core.getInput.mockImplementation((name) => {
@@ -779,7 +827,7 @@ describe('main.ts', () => {
         if (name === 'originUrl') return mockOriginUrl
         if (name === 'suiteIds') return 'suite1,suite2'
         if (name === 'failFast') return 'false'
-        if (name === 'block') return 'false'
+        if (name === 'block') return 'true'
         return ''
       })
 
