@@ -88,13 +88,13 @@ describe('main.ts', () => {
     jest.resetAllMocks()
     jest.clearAllMocks()
 
-    // Set up input mocks
+    // Set up input mocks — block: 'true' so tests exercise SSE path
     core.getInput.mockImplementation((name) => {
       if (name === 'apiKey') return mockApiKey
       if (name === 'originUrl') return mockOriginUrl
       if (name === 'suiteIds') return 'suite1,suite2'
       if (name === 'failFast') return 'false'
-      if (name === 'block') return 'false'
+      if (name === 'block') return 'true'
       return ''
     })
 
@@ -230,6 +230,34 @@ describe('main.ts', () => {
     )
   })
 
+  it('Should exit immediately in non-blocking mode (block: false)', async () => {
+    core.getInput.mockImplementation((name) => {
+      if (name === 'apiKey') return mockApiKey
+      if (name === 'originUrl') return mockOriginUrl
+      if (name === 'suiteIds') return 'suite1'
+      if (name === 'failFast') return 'false'
+      if (name === 'block') return 'false'
+      return ''
+    })
+
+    await run()
+
+    // Should trigger but NOT connect to SSE
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${mockOriginUrl}/external/actions/trigger`,
+      expect.any(Object)
+    )
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      `${mockOriginUrl}/external/actions/run/${mockRunId}/events`,
+      expect.any(Object)
+    )
+
+    // Should set runId and status='running'
+    expect(core.setOutput).toHaveBeenCalledWith('runId', mockRunId)
+    expect(core.setOutput).toHaveBeenCalledWith('status', 'running')
+    expect(core.setFailed).not.toHaveBeenCalled()
+  })
+
   describe('Bad statuses', () => {
     it.each(['failed', 'failed_pending', 'error', 'timed_out', 'cancelled'])(
       '[Un-happy] Should handle test run with status: %s',
@@ -354,13 +382,19 @@ describe('main.ts', () => {
             })
           })
           .mockImplementationOnce(async () => {
-            // Set up events for the reader with a failed status
+            // Pending/running event followed by a terminal "passed" event
             const encoder = new TextEncoder()
             mockReader.setEvents([
               {
                 done: false,
                 value: encoder.encode(
                   `event: test_suite_run.event\ndata: {"text": "blu blu", "status": "${status}"}\n\n`
+                )
+              },
+              {
+                done: false,
+                value: encoder.encode(
+                  'event: test_suite_run.event\ndata: {"text": "done", "status": "passed"}\n\n'
                 )
               },
               { done: true, value: new Uint8Array() }
@@ -374,7 +408,9 @@ describe('main.ts', () => {
 
         await run()
 
-        expect(core.setOutput).not.toHaveBeenCalledWith('status', status)
+        // The pending/running event should NOT trigger completion
+        // Only the terminal "passed" event should set the final status
+        expect(core.setOutput).toHaveBeenCalledWith('status', 'passed')
         expect(core.setFailed).not.toHaveBeenCalled()
       }
     )
@@ -391,7 +427,7 @@ describe('main.ts', () => {
         if (name === 'originUrl') return mockOriginUrl
         if (name === 'suiteIds') return 'suite1,suite2'
         if (name === 'failFast') return 'false'
-        if (name === 'block') return 'false'
+        if (name === 'block') return 'true'
         if (name === 'maxRetries') return '2' // Enable retries
         return ''
       })
@@ -532,7 +568,7 @@ describe('main.ts', () => {
     })
 
     it('Should not retry when maxRetries is 0 (default)', async () => {
-      // Reset mocks to default (no retries)
+      // Reset mocks to default (no retries, non-blocking)
       core.getInput.mockImplementation((name) => {
         if (name === 'apiKey') return mockApiKey
         if (name === 'originUrl') return mockOriginUrl
@@ -589,7 +625,7 @@ describe('main.ts', () => {
         if (name === 'originUrl') return mockOriginUrl
         if (name === 'suiteIds') return 'suite1,suite2'
         if (name === 'failFast') return 'false'
-        if (name === 'block') return 'false'
+        if (name === 'block') return 'true'
         if (name === 'timeout') return '1'
         return ''
       })
@@ -779,7 +815,7 @@ describe('main.ts', () => {
         if (name === 'originUrl') return mockOriginUrl
         if (name === 'suiteIds') return 'suite1,suite2'
         if (name === 'failFast') return 'false'
-        if (name === 'block') return 'false'
+        if (name === 'block') return 'true'
         return ''
       })
 

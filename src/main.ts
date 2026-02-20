@@ -101,43 +101,75 @@ async function retryWithBackoff<T>(
   throw lastError
 }
 
+const IDLE_TIMEOUT_MS = 60_000 // 60 seconds with no SSE events
+const POLL_INTERVAL_MS = 10_000 // 10 seconds between polling attempts
+
+type RunResult =
+  | { outcome: 'completed'; status: string }
+  | { outcome: 'idle_timeout' }
+  | { outcome: 'overall_timeout' }
+  | { outcome: 'error'; message: string }
+
 /**
- * Create an SSE client for real-time event streaming
- * @param url The SSE endpoint URL
- * @param headers Optional headers
+ * Connect to SSE endpoint for real-time event streaming.
+ * Returns a result indicating the outcome instead of calling core.setFailed directly.
  */
 async function connectToSSE(
   url: string,
   headers: Record<string, string>,
   timeoutSeconds: number
-): Promise<void> {
+): Promise<RunResult> {
+  const abortController = new AbortController()
+  let overallTimedOut = false
+  let idleTimedOut = false
+
+  const overallTimeoutId = setTimeout(() => {
+    overallTimedOut = true
+    abortController.abort()
+  }, timeoutSeconds * 1000)
+
   try {
-    const abortController = new AbortController()
-    let timedOut = false
-
-    const timeoutId = setTimeout(() => {
-      timedOut = true
-      abortController.abort()
-    }, timeoutSeconds * 1000)
-
     const response = await fetch(url, {
       method: 'GET',
       headers,
       signal: abortController.signal
     })
 
+    core.info(`SSE connection established (HTTP ${response.status})`)
+
     if (!response.ok || !response.body) {
-      throw new Error(`Failed to connect to SSE endpoint: ${response.status}`)
+      return {
+        outcome: 'error',
+        message: `Failed to connect to SSE endpoint: ${response.status}`
+      }
     }
 
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
 
+    // Idle timeout — resets on each received chunk
+    let idleTimeoutId: ReturnType<typeof setTimeout> | undefined
+
+    const resetIdleTimeout = (): void => {
+      if (idleTimeoutId) clearTimeout(idleTimeoutId)
+      idleTimeoutId = setTimeout(() => {
+        idleTimedOut = true
+        core.warning(
+          `No SSE events received for ${IDLE_TIMEOUT_MS / 1000}s, aborting SSE connection`
+        )
+        abortController.abort()
+      }, IDLE_TIMEOUT_MS)
+    }
+
+    resetIdleTimeout()
+
     try {
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
+
+        resetIdleTimeout()
 
         buffer += decoder.decode(value, { stream: true })
 
@@ -148,30 +180,23 @@ async function connectToSSE(
         for (const event of events) {
           if (!event.trim()) continue
 
+          // Skip SSE comments (heartbeats)
+          const lines = event.split('\n').filter((l) => !l.startsWith(':'))
+          if (lines.length === 0) continue
+
           // Extract the event data
-          const eventData = event
-            .split('\n')
+          const eventData = lines
             .find((l) => l.startsWith('data:'))
             ?.substring(5)
             .trim()
 
-          const eventType = event
-            .split('\n')
+          const eventType = lines
             .find((l) => l.startsWith('event:'))
             ?.substring(6)
             .trim()
 
           core.debug(`Event type: ${eventType}`)
           core.debug(`Event data: ${eventData}`)
-
-          /*
-           *  Example event data:
-           *
-           *  id: 22048943-4045-44dc-8b7c-2f41c8e637d6
-           *  event: test_suite_run.event
-           *  data: {"status": "passed", "elapsed": 4.678537, "end_time": "2025-05-21T21:45:37.774642+00:00", "test_ids": ["7eb44e14-6758-4180-9f87-81b42f54ff70", "5e220e7b-feb6-42fa-b3a5-ee5a12b5d50e"], "start_time": "2025-05-21T21:45:33.096100+00:00", "test_suite_id": "9acb9753-a6ca-4f4e-ba33-952f23978c9d", "ts": "2025-05-21T21:45:37.774642"}
-           *
-           */
 
           if (eventData) {
             try {
@@ -180,7 +205,9 @@ async function connectToSSE(
 
               const ts = event.ts ? new Date(event.ts).toISOString() : '-'
               const status = event.status
-              const elapsed = event.elapsed ? `(${event.elapsed} seconds)` : '-'
+              const elapsed = event.elapsed
+                ? `(${event.elapsed} seconds)`
+                : '-'
 
               core.info(`${eventType} at ${ts}: ${status} ${elapsed}`)
 
@@ -190,15 +217,7 @@ async function connectToSSE(
 
               // Check if the run has completed
               if (!['pending', 'running'].includes(status)) {
-                core.setOutput('status', status)
-
-                if (!['passed', 'flaky'].includes(status)) {
-                  core.setFailed(
-                    `Test suite execution failed with status: ${status}`
-                  )
-                }
-
-                return
+                return { outcome: 'completed', status }
               }
             } catch {
               core.warning(`Failed to parse event data: ${eventData}`)
@@ -206,30 +225,85 @@ async function connectToSSE(
           }
         }
       }
+
+      // Stream ended without a terminal status
+      return { outcome: 'error', message: 'SSE stream ended unexpectedly' }
     } catch (e) {
       if (e instanceof Error && e.name === 'AbortError') {
-        if (timedOut) {
-          core.setFailed(
-            `Timed out after ${timeoutSeconds}s waiting for test suite completion`
-          )
-        } else {
-          console.debug('SSE reader aborted')
+        if (overallTimedOut) {
+          return { outcome: 'overall_timeout' }
         }
-      } else {
-        throw e
+        if (idleTimedOut) {
+          return { outcome: 'idle_timeout' }
+        }
+        // Aborted for other reasons
+        return { outcome: 'error', message: 'SSE connection aborted' }
       }
+      throw e
     } finally {
-      clearTimeout(timeoutId)
+      if (idleTimeoutId) clearTimeout(idleTimeoutId)
       reader.releaseLock()
-      abortController.abort()
     }
   } catch (error) {
-    if (error instanceof Error) {
-      core.setFailed(`SSE connection error: ${error.message}`)
-    } else {
-      core.setFailed('Unknown SSE connection error')
+    if (error instanceof Error && error.name === 'AbortError') {
+      if (overallTimedOut) return { outcome: 'overall_timeout' }
+      if (idleTimedOut) return { outcome: 'idle_timeout' }
     }
+    return {
+      outcome: 'error',
+      message:
+        error instanceof Error ? error.message : 'Unknown SSE connection error'
+    }
+  } finally {
+    clearTimeout(overallTimeoutId)
+    abortController.abort()
   }
+}
+
+/**
+ * Poll the run status via REST API as a fallback when SSE is unavailable.
+ */
+async function pollRunStatus(
+  originUrl: string,
+  runId: string,
+  headers: Record<string, string>,
+  timeoutSeconds: number
+): Promise<RunResult> {
+  const deadline = Date.now() + timeoutSeconds * 1000
+
+  core.info('Switching to polling mode for run status updates')
+
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(
+        `${originUrl}/external/actions/run/${runId}`,
+        { method: 'GET', headers }
+      )
+
+      if (!response.ok) {
+        core.warning(`Polling request failed with status ${response.status}`)
+        await sleep(POLL_INTERVAL_MS)
+        continue
+      }
+
+      const data = (await response.json()) as Record<string, unknown>
+      const status = data.status as string
+
+      core.info(`Polling run status: ${status}`)
+
+      if (!['pending', 'running'].includes(status)) {
+        return { outcome: 'completed', status }
+      }
+    } catch (error) {
+      core.warning(
+        `Polling error: ${error instanceof Error ? error.message : 'unknown'}`
+      )
+    }
+
+    await sleep(POLL_INTERVAL_MS)
+  }
+
+  return { outcome: 'overall_timeout' }
 }
 
 /**
@@ -269,9 +343,6 @@ export async function run(): Promise<void> {
     if (suiteIds) body.suite_ids = suiteIds
     body.fail_fast = failFast
     if (vars) body.vars = vars
-
-    // Not implemented yet
-    // body.block = block
 
     try {
       const versionUrl = `${originUrl}/version`
@@ -360,19 +431,56 @@ export async function run(): Promise<void> {
     core.info(`Run ID: ${runId}`)
     core.setOutput('runId', runId)
 
+    // Non-blocking mode: exit immediately after triggering
+    if (!block) {
+      core.info(`Run triggered (non-blocking mode). Run ID: ${runId}`)
+      core.setOutput('status', 'running')
+      return
+    }
+
     // Connect to SSE for real-time events
     const sseUrl = `${originUrl}/external/actions/run/${runId}/events`
     core.info(`Connecting to SSE endpoint: ${sseUrl}`)
 
-    await connectToSSE(
-      sseUrl,
-      {
-        'X-Api-Key': apiKey
-      },
-      timeout
-    )
+    const authHeaders = { 'X-Api-Key': apiKey }
+    let result = await connectToSSE(sseUrl, authHeaders, timeout)
 
-    core.info('Test suite execution completed')
+    // If SSE produced no events (idle timeout), fall back to polling
+    if (result.outcome === 'idle_timeout') {
+      core.info(
+        'SSE connection idle — falling back to REST polling for run status'
+      )
+      const elapsedSeconds = Math.round(IDLE_TIMEOUT_MS / 1000)
+      const remainingTimeout = Math.max(timeout - elapsedSeconds, 30)
+      result = await pollRunStatus(
+        originUrl,
+        runId,
+        authHeaders,
+        remainingTimeout
+      )
+    }
+
+    // Handle the final result
+    switch (result.outcome) {
+      case 'completed':
+        core.setOutput('status', result.status)
+        if (!['passed', 'flaky'].includes(result.status)) {
+          core.setFailed(
+            `Test suite execution failed with status: ${result.status}`
+          )
+        } else {
+          core.info('Test suite execution completed')
+        }
+        break
+      case 'overall_timeout':
+        core.setFailed(
+          `Timed out after ${timeout}s waiting for test suite completion`
+        )
+        break
+      case 'error':
+        core.setFailed(`SSE connection error: ${result.message}`)
+        break
+    }
   } catch (error) {
     // Fail the workflow run if an error occurs
     if (error instanceof Error) core.setFailed(error.message)
