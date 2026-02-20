@@ -27332,24 +27332,84 @@ async function retryWithBackoff(fn, maxRetries, retryableErrorCheck) {
     }
     throw lastError;
 }
+const IDLE_TIMEOUT_MS = 60_000;
+const POLL_INTERVAL_MS = 10_000;
 /**
- * Create an SSE client for real-time event streaming
- * @param url The SSE endpoint URL
- * @param headers Optional headers
+ * Poll the run status endpoint as a fallback when SSE produces no events.
+ * Uses the /api/v1/test-suite-runs/{runId} endpoint with Bearer auth.
+ * Returns when the run reaches a terminal state.
  */
-async function connectToSSE(url, headers, timeoutSeconds) {
+async function pollRunStatus(originUrl, apiKey, runId, timeoutSeconds, startTime) {
+    coreExports.info('Switching to polling mode for run status');
+    const pollUrl = `${originUrl}/api/v1/test-suite-runs/${runId}`;
+    const pollHeaders = { Authorization: `Bearer ${apiKey}` };
+    while (true) {
+        const elapsed = (Date.now() - startTime) / 1000;
+        if (elapsed >= timeoutSeconds) {
+            coreExports.setFailed(`Timed out after ${timeoutSeconds}s waiting for test suite completion`);
+            return;
+        }
+        try {
+            const response = await fetch(pollUrl, {
+                method: 'GET',
+                headers: pollHeaders
+            });
+            if (!response.ok) {
+                coreExports.warning(`Poll request failed with status ${response.status}`);
+                await sleep(POLL_INTERVAL_MS);
+                continue;
+            }
+            const data = (await response.json());
+            const status = data.run_status || data.status;
+            coreExports.info(`Polling run status: ${status}`);
+            if (status && !['pending', 'running'].includes(status)) {
+                coreExports.setOutput('status', status);
+                if (!['passed', 'flaky'].includes(status)) {
+                    coreExports.setFailed(`Test suite execution failed with status: ${status}`);
+                }
+                return;
+            }
+        }
+        catch (error) {
+            coreExports.warning(`Poll request error: ${error instanceof Error ? error.message : 'unknown'}`);
+        }
+        await sleep(POLL_INTERVAL_MS);
+    }
+}
+/**
+ * Create an SSE client for real-time event streaming.
+ * Includes idle timeout detection and automatic fallback to polling.
+ */
+async function connectToSSE(url, headers, timeoutSeconds, originUrl, apiKey, runId) {
+    const startTime = Date.now();
     try {
         const abortController = new AbortController();
         let timedOut = false;
+        let idleTimedOut = false;
+        // Overall timeout
         const timeoutId = setTimeout(() => {
             timedOut = true;
             abortController.abort();
         }, timeoutSeconds * 1000);
+        // Idle timeout — resets on each received event
+        let idleTimeoutId = null;
+        const resetIdleTimeout = () => {
+            if (idleTimeoutId)
+                clearTimeout(idleTimeoutId);
+            idleTimeoutId = setTimeout(() => {
+                idleTimedOut = true;
+                coreExports.warning(`No SSE events received for ${IDLE_TIMEOUT_MS / 1000}s, aborting SSE connection`);
+                abortController.abort();
+            }, IDLE_TIMEOUT_MS);
+        };
+        // Start the idle timer immediately after connecting
+        resetIdleTimeout();
         const response = await fetch(url, {
             method: 'GET',
             headers,
             signal: abortController.signal
         });
+        coreExports.info(`SSE connection established (HTTP ${response.status})`);
         if (!response.ok || !response.body) {
             throw new Error(`Failed to connect to SSE endpoint: ${response.status}`);
         }
@@ -27368,14 +27428,22 @@ async function connectToSSE(url, headers, timeoutSeconds) {
                 for (const event of events) {
                     if (!event.trim())
                         continue;
+                    // Skip SSE comments (heartbeats)
+                    const lines = event.split('\n');
+                    const isOnlyComments = lines.every((l) => l.startsWith(':') || !l.trim());
+                    if (isOnlyComments) {
+                        coreExports.debug('Received SSE heartbeat');
+                        resetIdleTimeout();
+                        continue;
+                    }
+                    // Reset idle timeout on any real event
+                    resetIdleTimeout();
                     // Extract the event data
-                    const eventData = event
-                        .split('\n')
+                    const eventData = lines
                         .find((l) => l.startsWith('data:'))
                         ?.substring(5)
                         .trim();
-                    const eventType = event
-                        .split('\n')
+                    const eventType = lines
                         .find((l) => l.startsWith('event:'))
                         ?.substring(6)
                         .trim();
@@ -27421,6 +27489,10 @@ async function connectToSSE(url, headers, timeoutSeconds) {
                 if (timedOut) {
                     coreExports.setFailed(`Timed out after ${timeoutSeconds}s waiting for test suite completion`);
                 }
+                else if (idleTimedOut) {
+                    // Fall back to polling
+                    await pollRunStatus(originUrl, apiKey, runId, timeoutSeconds, startTime);
+                }
                 else {
                     console.debug('SSE reader aborted');
                 }
@@ -27431,6 +27503,8 @@ async function connectToSSE(url, headers, timeoutSeconds) {
         }
         finally {
             clearTimeout(timeoutId);
+            if (idleTimeoutId)
+                clearTimeout(idleTimeoutId);
             reader.releaseLock();
             abortController.abort();
         }
@@ -27479,8 +27553,6 @@ async function run() {
         body.fail_fast = failFast;
         if (vars)
             body.vars = vars;
-        // Not implemented yet
-        // body.block = block
         try {
             const versionUrl = `${originUrl}/version`;
             const fetchVersion = async () => {
@@ -27546,12 +27618,18 @@ async function run() {
         }
         coreExports.info(`Run ID: ${runId}`);
         coreExports.setOutput('runId', runId);
-        // Connect to SSE for real-time events
+        // Non-blocking mode: exit immediately after trigger
+        if (!block) {
+            coreExports.info(`Run triggered successfully (non-blocking mode). Run ID: ${runId}`);
+            coreExports.setOutput('status', 'running');
+            return;
+        }
+        // Connect to SSE for real-time events (blocking mode)
         const sseUrl = `${originUrl}/external/actions/run/${runId}/events`;
         coreExports.info(`Connecting to SSE endpoint: ${sseUrl}`);
         await connectToSSE(sseUrl, {
             'X-Api-Key': apiKey
-        }, timeout);
+        }, timeout, originUrl, apiKey, runId);
         coreExports.info('Test suite execution completed');
     }
     catch (error) {

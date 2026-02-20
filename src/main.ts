@@ -101,30 +101,125 @@ async function retryWithBackoff<T>(
   throw lastError
 }
 
+const IDLE_TIMEOUT_MS = 60_000
+const POLL_INTERVAL_MS = 10_000
+
 /**
- * Create an SSE client for real-time event streaming
- * @param url The SSE endpoint URL
- * @param headers Optional headers
+ * Poll the run status endpoint as a fallback when SSE produces no events.
+ * Uses the /api/v1/test-suite-runs/{runId} endpoint with Bearer auth.
+ * Returns when the run reaches a terminal state.
+ */
+async function pollRunStatus(
+  originUrl: string,
+  apiKey: string,
+  runId: string,
+  timeoutSeconds: number,
+  startTime: number
+): Promise<void> {
+  core.info('Switching to polling mode for run status')
+
+  const pollUrl = `${originUrl}/api/v1/test-suite-runs/${runId}`
+  const pollHeaders = { Authorization: `Bearer ${apiKey}` }
+
+  while (true) {
+    const elapsed = (Date.now() - startTime) / 1000
+    if (elapsed >= timeoutSeconds) {
+      core.setFailed(
+        `Timed out after ${timeoutSeconds}s waiting for test suite completion`
+      )
+      return
+    }
+
+    try {
+      const response = await fetch(pollUrl, {
+        method: 'GET',
+        headers: pollHeaders
+      })
+
+      if (!response.ok) {
+        core.warning(`Poll request failed with status ${response.status}`)
+        await sleep(POLL_INTERVAL_MS)
+        continue
+      }
+
+      const data = (await response.json()) as {
+        run_status?: string
+        status?: string
+      }
+      const status = data.run_status || data.status
+
+      core.info(`Polling run status: ${status}`)
+
+      if (status && !['pending', 'running'].includes(status)) {
+        core.setOutput('status', status)
+
+        if (!['passed', 'flaky'].includes(status)) {
+          core.setFailed(
+            `Test suite execution failed with status: ${status}`
+          )
+        }
+
+        return
+      }
+    } catch (error) {
+      core.warning(
+        `Poll request error: ${error instanceof Error ? error.message : 'unknown'}`
+      )
+    }
+
+    await sleep(POLL_INTERVAL_MS)
+  }
+}
+
+/**
+ * Create an SSE client for real-time event streaming.
+ * Includes idle timeout detection and automatic fallback to polling.
  */
 async function connectToSSE(
   url: string,
   headers: Record<string, string>,
-  timeoutSeconds: number
+  timeoutSeconds: number,
+  originUrl: string,
+  apiKey: string,
+  runId: string
 ): Promise<void> {
+  const startTime = Date.now()
+
   try {
     const abortController = new AbortController()
     let timedOut = false
+    let idleTimedOut = false
 
+    // Overall timeout
     const timeoutId = setTimeout(() => {
       timedOut = true
       abortController.abort()
     }, timeoutSeconds * 1000)
+
+    // Idle timeout — resets on each received event
+    let idleTimeoutId: ReturnType<typeof setTimeout> | null = null
+
+    const resetIdleTimeout = (): void => {
+      if (idleTimeoutId) clearTimeout(idleTimeoutId)
+      idleTimeoutId = setTimeout(() => {
+        idleTimedOut = true
+        core.warning(
+          `No SSE events received for ${IDLE_TIMEOUT_MS / 1000}s, aborting SSE connection`
+        )
+        abortController.abort()
+      }, IDLE_TIMEOUT_MS)
+    }
+
+    // Start the idle timer immediately after connecting
+    resetIdleTimeout()
 
     const response = await fetch(url, {
       method: 'GET',
       headers,
       signal: abortController.signal
     })
+
+    core.info(`SSE connection established (HTTP ${response.status})`)
 
     if (!response.ok || !response.body) {
       throw new Error(`Failed to connect to SSE endpoint: ${response.status}`)
@@ -148,15 +243,27 @@ async function connectToSSE(
         for (const event of events) {
           if (!event.trim()) continue
 
+          // Skip SSE comments (heartbeats)
+          const lines = event.split('\n')
+          const isOnlyComments = lines.every(
+            (l) => l.startsWith(':') || !l.trim()
+          )
+          if (isOnlyComments) {
+            core.debug('Received SSE heartbeat')
+            resetIdleTimeout()
+            continue
+          }
+
+          // Reset idle timeout on any real event
+          resetIdleTimeout()
+
           // Extract the event data
-          const eventData = event
-            .split('\n')
+          const eventData = lines
             .find((l) => l.startsWith('data:'))
             ?.substring(5)
             .trim()
 
-          const eventType = event
-            .split('\n')
+          const eventType = lines
             .find((l) => l.startsWith('event:'))
             ?.substring(6)
             .trim()
@@ -212,6 +319,15 @@ async function connectToSSE(
           core.setFailed(
             `Timed out after ${timeoutSeconds}s waiting for test suite completion`
           )
+        } else if (idleTimedOut) {
+          // Fall back to polling
+          await pollRunStatus(
+            originUrl,
+            apiKey,
+            runId,
+            timeoutSeconds,
+            startTime
+          )
         } else {
           console.debug('SSE reader aborted')
         }
@@ -220,6 +336,7 @@ async function connectToSSE(
       }
     } finally {
       clearTimeout(timeoutId)
+      if (idleTimeoutId) clearTimeout(idleTimeoutId)
       reader.releaseLock()
       abortController.abort()
     }
@@ -269,9 +386,6 @@ export async function run(): Promise<void> {
     if (suiteIds) body.suite_ids = suiteIds
     body.fail_fast = failFast
     if (vars) body.vars = vars
-
-    // Not implemented yet
-    // body.block = block
 
     try {
       const versionUrl = `${originUrl}/version`
@@ -360,7 +474,14 @@ export async function run(): Promise<void> {
     core.info(`Run ID: ${runId}`)
     core.setOutput('runId', runId)
 
-    // Connect to SSE for real-time events
+    // Non-blocking mode: exit immediately after trigger
+    if (!block) {
+      core.info(`Run triggered successfully (non-blocking mode). Run ID: ${runId}`)
+      core.setOutput('status', 'running')
+      return
+    }
+
+    // Connect to SSE for real-time events (blocking mode)
     const sseUrl = `${originUrl}/external/actions/run/${runId}/events`
     core.info(`Connecting to SSE endpoint: ${sseUrl}`)
 
@@ -369,7 +490,10 @@ export async function run(): Promise<void> {
       {
         'X-Api-Key': apiKey
       },
-      timeout
+      timeout,
+      originUrl,
+      apiKey,
+      runId
     )
 
     core.info('Test suite execution completed')
