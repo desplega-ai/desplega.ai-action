@@ -820,6 +820,140 @@ describe('main.ts', () => {
     })
   })
 
+  describe('SSE CRLF line endings', () => {
+    it('Should correctly parse events with \\r\\n line endings', async () => {
+      core.getInput.mockImplementation((name) => {
+        if (name === 'apiKey') return mockApiKey
+        if (name === 'originUrl') return mockOriginUrl
+        if (name === 'suiteIds') return 'suite1,suite2'
+        if (name === 'failFast') return 'false'
+        if (name === 'block') return 'true'
+        return ''
+      })
+
+      fetchMock.mockImplementation(async (url) => {
+        if (url === `${mockOriginUrl}/version`) {
+          return createMockResponse({
+            ok: true,
+            json: async () => ({ version: '1337' })
+          })
+        } else if (url === `${mockOriginUrl}/external/actions/trigger`) {
+          return createMockResponse({
+            ok: true,
+            json: async () => ({ run_id: mockRunId })
+          })
+        } else if (
+          url === `${mockOriginUrl}/external/actions/run/${mockRunId}/events`
+        ) {
+          const encoder = new TextEncoder()
+          // Use CRLF line endings like the real server sends
+          const crlfReader = new MockReadableStreamDefaultReader()
+          crlfReader.setEvents([
+            {
+              done: false,
+              value: encoder.encode(
+                'event: test_suite_run.event\r\ndata: {"status": "passed", "elapsed": 5.0}\r\n\r\n'
+              )
+            },
+            { done: true, value: new Uint8Array() }
+          ])
+
+          return createMockResponse({
+            ok: true,
+            body: { getReader: () => crlfReader }
+          })
+        }
+
+        return createMockResponse({
+          ok: false,
+          status: 404,
+          text: async () => 'Not found'
+        })
+      })
+
+      await run()
+
+      expect(core.setOutput).toHaveBeenCalledWith('status', 'passed')
+      expect(core.setFailed).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('SSE CRLF with partial chunks', () => {
+    it('Should correctly parse CRLF events split across multiple chunks', async () => {
+      core.getInput.mockImplementation((name) => {
+        if (name === 'apiKey') return mockApiKey
+        if (name === 'originUrl') return mockOriginUrl
+        if (name === 'suiteIds') return 'suite1,suite2'
+        if (name === 'failFast') return 'false'
+        if (name === 'block') return 'true'
+        return ''
+      })
+
+      fetchMock.mockImplementation(async (url) => {
+        if (url === `${mockOriginUrl}/version`) {
+          return createMockResponse({
+            ok: true,
+            json: async () => ({ version: '1337' })
+          })
+        } else if (url === `${mockOriginUrl}/external/actions/trigger`) {
+          return createMockResponse({
+            ok: true,
+            json: async () => ({ run_id: mockRunId })
+          })
+        } else if (
+          url === `${mockOriginUrl}/external/actions/run/${mockRunId}/events`
+        ) {
+          const encoder = new TextEncoder()
+          // Simulate real-world: CRLF events arriving in separate chunks
+          const crlfChunkReader = new MockReadableStreamDefaultReader()
+          crlfChunkReader.setEvents([
+            {
+              done: false,
+              value: encoder.encode(
+                'id: abc\r\nevent: test_suite_run.event\r\ndata: {"status": "running"}\r\n\r\n'
+              )
+            },
+            {
+              done: false,
+              value: encoder.encode(
+                'id: def\r\nevent: test_run.event\r\ndata: {"status": "passed", "test_id": "t1"}\r\n\r\n'
+              )
+            },
+            {
+              done: false,
+              value: encoder.encode(
+                'id: ghi\r\nevent: test_suite_run.event\r\ndata: {"status": "passed",'
+              )
+            },
+            {
+              done: false,
+              value: encoder.encode(
+                ' "elapsed": 5.0}\r\n\r\n'
+              )
+            },
+            { done: true, value: new Uint8Array() }
+          ])
+
+          return createMockResponse({
+            ok: true,
+            body: { getReader: () => crlfChunkReader }
+          })
+        }
+
+        return createMockResponse({
+          ok: false,
+          status: 404,
+          text: async () => 'Not found'
+        })
+      })
+
+      await run()
+
+      expect(core.setOutput).toHaveBeenCalledWith('status', 'passed')
+      expect(core.setFailed).not.toHaveBeenCalled()
+    })
+  })
+
   describe('SSE buffer partial chunk parsing', () => {
     it('Should correctly parse events split across multiple chunks', async () => {
       core.getInput.mockImplementation((name) => {

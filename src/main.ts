@@ -234,7 +234,8 @@ async function connectToSSE(
         const { done, value } = await reader.read()
         if (done) break
 
-        buffer += decoder.decode(value, { stream: true })
+        // Normalize \r\n to \n — some servers send CRLF line endings
+        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
 
         // Process complete events in the buffer
         const events = buffer.split('\n\n')
